@@ -1,0 +1,459 @@
+Set-StrictMode -Version Latest
+
+function ConvertTo-SafeFileComponent {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string] $Value
+    )
+
+    $invalid = [System.IO.Path]::GetInvalidFileNameChars()
+    $safe = -join ($Value.ToCharArray() | ForEach-Object {
+            if ($invalid -contains $_) { '_' } else { $_ }
+        })
+    return $safe.Trim()
+}
+
+function Get-NormalizedOutputPath {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string] $Path
+    )
+
+    $extension = [System.IO.Path]::GetExtension($Path)
+    if ($extension -notin '.themepack', '.deskthemepack') {
+        return "$Path.deskthemepack"
+    }
+
+    return $Path
+}
+
+function New-StagingFolder {
+    [CmdletBinding()]
+    param()
+
+    $root = Join-Path -Path ([System.IO.Path]::GetTempPath()) -ChildPath ("Themify_{0}" -f [guid]::NewGuid())
+    $null = New-Item -Path $root -ItemType Directory -Force
+    $null = New-Item -Path (Join-Path -Path $root -ChildPath 'DesktopBackground') -ItemType Directory -Force
+    $null = New-Item -Path (Join-Path -Path $root -ChildPath 'Cursors') -ItemType Directory -Force
+    $null = New-Item -Path (Join-Path -Path $root -ChildPath 'Sounds') -ItemType Directory -Force
+    return $root
+}
+
+function Get-WallpaperFiles {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string] $SourcePath,
+        [Parameter(Mandatory)]
+        [string[]] $Extensions
+    )
+
+    $extensionSet = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($ext in $Extensions) {
+        $normalized = if ($ext.StartsWith('.')) { $ext } else { ".$ext" }
+        [void] $extensionSet.Add($normalized)
+    }
+
+    Get-ChildItem -Path $SourcePath -Recurse -File |
+        Where-Object { $extensionSet.Contains($_.Extension) } |
+        Sort-Object FullName
+}
+
+function Copy-Wallpapers {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string] $ThemeName,
+        [Parameter(Mandatory)]
+        [System.IO.FileInfo[]] $Files,
+        [Parameter(Mandatory)]
+        [string] $StagingRoot
+    )
+
+    $safeThemeName = ConvertTo-SafeFileComponent -Value $ThemeName
+    $entries = [System.Collections.Generic.List[hashtable]]::new()
+    $index = 0
+
+    foreach ($file in $Files) {
+        $targetName = '{0}.Wallpaper{1}{2}' -f $safeThemeName, $index, $file.Extension.ToLowerInvariant()
+        $relativePath = Join-Path -Path 'DesktopBackground' -ChildPath $targetName
+        $fullPath = Join-Path -Path $StagingRoot -ChildPath $relativePath
+        Copy-Item -Path $file.FullName -Destination $fullPath -Force
+
+        $entries.Add(@{
+                RelativePath = $relativePath
+                FullPath     = $fullPath
+                Size         = (Get-Item -Path $fullPath).Length
+            })
+        $index++
+    }
+
+    return $entries
+}
+
+function Copy-MappedResources {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string] $ThemeName,
+        [Parameter(Mandatory)]
+        [hashtable] $Map,
+        [Parameter(Mandatory)]
+        [string] $SectionName,
+        [Parameter(Mandatory)]
+        [string] $TargetFolder,
+        [Parameter(Mandatory)]
+        [string] $StagingRoot,
+        [string] $SourcePath
+    )
+
+    $safeThemeName = ConvertTo-SafeFileComponent -Value $ThemeName
+    $result = @{}
+    if ([string]::IsNullOrWhiteSpace($SourcePath)) {
+        return $result
+    }
+
+    foreach ($logicalName in ($Map.Keys | Sort-Object)) {
+        $sourceName = [string] $Map[$logicalName]
+        $sourceFile = Join-Path -Path $SourcePath -ChildPath $sourceName
+        if (-not (Test-Path -Path $sourceFile -PathType Leaf)) {
+            throw "Mapped $SectionName source file not found for '$logicalName': $sourceFile"
+        }
+
+        $extension = [System.IO.Path]::GetExtension($sourceFile).ToLowerInvariant()
+        $targetName = '{0}.{1}.{2}{3}' -f $safeThemeName, $SectionName, $logicalName, $extension
+        $relativePath = Join-Path -Path $TargetFolder -ChildPath $targetName
+        $fullPath = Join-Path -Path $StagingRoot -ChildPath $relativePath
+        Copy-Item -Path $sourceFile -Destination $fullPath -Force
+
+        $result[$logicalName] = @{
+            RelativePath = $relativePath
+            FullPath     = $fullPath
+            Size         = (Get-Item -Path $fullPath).Length
+        }
+    }
+
+    return $result
+}
+
+function New-ThemeContent {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string] $ThemeName,
+        [Parameter(Mandatory)]
+        [string] $DefaultWallpaperRelativePath,
+        [Parameter(Mandatory)]
+        [int] $SlideshowInterval,
+        [Parameter(Mandatory)]
+        [bool] $Shuffle,
+        [Parameter(Mandatory)]
+        [hashtable] $CursorEntries
+    )
+
+    $themeId = [guid]::NewGuid().Guid
+    $lines = [System.Collections.Generic.List[string]]::new()
+    $lines.Add('; Generated by iBug Themify PowerShell')
+    $lines.Add('; Created at: {0}' -f (Get-Date))
+    $lines.Add('')
+    $lines.Add('[MasterThemeSelector]')
+    $lines.Add('MTSM=DABJDKT')
+    $lines.Add('')
+    $lines.Add('[Theme]')
+    $lines.Add("DisplayName=$ThemeName")
+    $lines.Add("ThemeId={$themeId}")
+    $lines.Add('')
+    $lines.Add('[Control Panel\Desktop]')
+    $lines.Add("Wallpaper=$DefaultWallpaperRelativePath")
+    $lines.Add('Pattern=')
+    $lines.Add('MultimonBackgrounds=0')
+    $lines.Add('PicturePosition=4')
+    $lines.Add('')
+    $lines.Add('[VisualStyles]')
+    $lines.Add('Path=%SystemRoot%\Resources\Themes\Aero\Aero.msstyles')
+    $lines.Add('ColorStyle=NormalColor')
+    $lines.Add('Size=NormalSize')
+    $lines.Add('AutoColorization=1')
+    $lines.Add('ColorizationColor=0XC40078D7')
+    $lines.Add('VisualStyleVersion=10')
+    $lines.Add('Transparency=1')
+    $lines.Add('')
+    $lines.Add('[Control Panel\Cursors]')
+
+    $defaultCursorValues = @{
+        AppStarting = '%SystemRoot%\cursors\aero_working.ani'
+        Arrow       = '%SystemRoot%\cursors\aero_arrow.cur'
+        Hand        = '%SystemRoot%\cursors\aero_link.cur'
+        Help        = '%SystemRoot%\cursors\aero_helpsel.cur'
+        No          = '%SystemRoot%\cursors\aero_unavail.cur'
+        NWPen       = '%SystemRoot%\cursors\aero_pen.cur'
+        SizeAll     = '%SystemRoot%\cursors\aero_move.cur'
+        SizeNESW    = '%SystemRoot%\cursors\aero_nesw.cur'
+        SizeNS      = '%SystemRoot%\cursors\aero_ns.cur'
+        SizeNWSE    = '%SystemRoot%\cursors\aero_nwse.cur'
+        SizeWE      = '%SystemRoot%\cursors\aero_ew.cur'
+        UpArrow     = '%SystemRoot%\cursors\aero_up.cur'
+        Wait        = '%SystemRoot%\cursors\aero_busy.ani'
+    }
+
+    foreach ($cursorName in ($defaultCursorValues.Keys | Sort-Object)) {
+        if ($CursorEntries.ContainsKey($cursorName)) {
+            $lines.Add("$cursorName=$($CursorEntries[$cursorName].RelativePath)")
+        }
+        else {
+            $lines.Add("$cursorName=$($defaultCursorValues[$cursorName])")
+        }
+    }
+
+    $lines.Add('DefaultValue=Windows Default')
+    $lines.Add('')
+    $lines.Add('[Sounds]')
+    $lines.Add('SchemeName=Windows Default')
+    $lines.Add('')
+    $lines.Add('[Slideshow]')
+    $lines.Add('Interval={0}' -f $SlideshowInterval)
+    $lines.Add('Shuffle={0}' -f ([int] $Shuffle))
+    $lines.Add('ImagesRootPath=DesktopBackground')
+    $lines.Add('')
+
+    return $lines
+}
+
+function New-DdfFiles {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string] $WorkingPath,
+        [Parameter(Mandatory)]
+        [string] $OutputPath,
+        [Parameter(Mandatory)]
+        [string] $ThemeFilePath,
+        [Parameter(Mandatory)]
+        [System.Collections.IEnumerable] $ResourceEntries,
+        [int] $ChunkSize = 1000
+    )
+
+    $allEntries = @(
+        @{
+            SourcePath   = $ThemeFilePath
+            RelativePath = [System.IO.Path]::GetFileName($ThemeFilePath)
+        }
+    ) + @($ResourceEntries)
+
+    $directiveFiles = [System.Collections.Generic.List[string]]::new()
+    $chunks = [System.Collections.Generic.List[object[]]]::new()
+    $bucket = [System.Collections.Generic.List[object]]::new()
+
+    foreach ($entry in $allEntries) {
+        $bucket.Add($entry)
+        if ($bucket.Count -ge $ChunkSize) {
+            $chunks.Add($bucket.ToArray())
+            $bucket = [System.Collections.Generic.List[object]]::new()
+        }
+    }
+    if ($bucket.Count -gt 0) {
+        $chunks.Add($bucket.ToArray())
+    }
+
+    $outputFileName = [System.IO.Path]::GetFileName($OutputPath)
+    $outputParent = Split-Path -Path $OutputPath -Parent
+    if ([string]::IsNullOrWhiteSpace($outputParent)) {
+        $outputParent = (Get-Location).Path
+    }
+    $outputFolder = (Resolve-Path -Path $outputParent).Path
+
+    for ($i = 0; $i -lt $chunks.Count; $i++) {
+        $ddfPath = Join-Path -Path $WorkingPath -ChildPath ("themify.{0}.ddf" -f ($i + 1))
+        $lines = [System.Collections.Generic.List[string]]::new()
+        $lines.Add('.OPTION EXPLICIT')
+        $lines.Add('.Set CabinetNameTemplate={0}' -f $outputFileName)
+        $lines.Add('.Set DiskDirectory1={0}' -f $outputFolder)
+        $lines.Add('.Set CompressionType=MSZIP')
+        $lines.Add('.Set Cabinet=on')
+        $lines.Add('.Set Compress=on')
+        $lines.Add('.Set CabinetFileCountThreshold=0')
+        $lines.Add('.Set FolderFileCountThreshold=0')
+        $lines.Add('.Set FolderSizeThreshold=0')
+        $lines.Add('.Set MaxCabinetSize=0')
+        $lines.Add('.Set MaxDiskFileCount=0')
+        $lines.Add('.Set MaxDiskSize=0')
+
+        foreach ($entry in $chunks[$i]) {
+            $lines.Add("""$($entry.SourcePath)"" ""$($entry.RelativePath)""")
+        }
+
+        Set-Content -Path $ddfPath -Value $lines -Encoding ASCII
+        $directiveFiles.Add($ddfPath)
+    }
+
+    return $directiveFiles
+}
+
+function Invoke-MakeCab {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string[]] $DirectiveFilePaths
+    )
+
+    $argumentList = [System.Collections.Generic.List[string]]::new()
+    foreach ($ddf in $DirectiveFilePaths) {
+        $argumentList.Add('/F')
+        $argumentList.Add($ddf)
+    }
+
+    $workingDirectory = Split-Path -Path $DirectiveFilePaths[0] -Parent
+    $process = Start-Process -FilePath 'makecab.exe' -ArgumentList $argumentList.ToArray() -WorkingDirectory $workingDirectory -NoNewWindow -Wait -PassThru
+    if ($process.ExitCode -ne 0) {
+        throw "makecab.exe failed with exit code $($process.ExitCode)."
+    }
+}
+
+function New-ThemifyDesktopThemePack {
+    [CmdletBinding(SupportsShouldProcess = $true)]
+    param(
+        [Parameter(Mandatory)]
+        [ValidateScript({ Test-Path -Path $_ -PathType Container })]
+        [string] $SourcePath,
+
+        [Parameter(Mandatory)]
+        [ValidateNotNullOrEmpty()]
+        [string] $ThemeName,
+
+        [Parameter()]
+        [ValidateNotNullOrEmpty()]
+        [string] $OutputPath = (Join-Path -Path (Get-Location) -ChildPath 'Output.deskthemepack'),
+
+        [Parameter()]
+        [ValidateRange(1, [int]::MaxValue)]
+        [int] $SlideshowInterval = 600000,
+
+        [Parameter()]
+        [switch] $Shuffle,
+
+        [Parameter()]
+        [ValidateNotNullOrEmpty()]
+        [string[]] $WallpaperExtensions = @('.bmp', '.jpg', '.jpeg', '.png'),
+
+        [Parameter()]
+        [ValidateScript({ Test-Path -Path $_ -PathType Container })]
+        [string] $CursorSourcePath,
+
+        [Parameter()]
+        [ValidateScript({ Test-Path -Path $_ -PathType Container })]
+        [string] $SoundSourcePath,
+
+        [Parameter()]
+        [ValidateScript({ Test-Path -Path $_ -PathType Leaf })]
+        [string] $ResourceMapPath = (Join-Path -Path $PSScriptRoot -ChildPath 'ResourceNameMap.psd1'),
+
+        [Parameter()]
+        [switch] $PassThru
+    )
+
+    $resolvedOutputPath = Get-NormalizedOutputPath -Path $OutputPath
+    $resolvedSourcePath = (Resolve-Path -Path $SourcePath).Path
+    $resolvedOutputParent = Split-Path -Path $resolvedOutputPath -Parent
+    if ([string]::IsNullOrWhiteSpace($resolvedOutputParent)) {
+        $resolvedOutputParent = (Get-Location).Path
+        $resolvedOutputPath = Join-Path -Path $resolvedOutputParent -ChildPath $resolvedOutputPath
+    }
+    if (-not (Test-Path -Path $resolvedOutputParent -PathType Container)) {
+        $null = New-Item -Path $resolvedOutputParent -ItemType Directory -Force
+    }
+
+    if (-not $PSCmdlet.ShouldProcess($resolvedOutputPath, 'Create desktop theme pack')) {
+        return
+    }
+
+    $mapConfig = Import-PowerShellDataFile -Path $ResourceMapPath
+    if (-not $mapConfig.ContainsKey('Cursors')) {
+        throw "Resource map '$ResourceMapPath' must contain a 'Cursors' hashtable."
+    }
+    if (-not $mapConfig.ContainsKey('Sounds')) {
+        throw "Resource map '$ResourceMapPath' must contain a 'Sounds' hashtable."
+    }
+
+    $stagingRoot = New-StagingFolder
+    try {
+        $wallpapers = @(Get-WallpaperFiles -SourcePath $resolvedSourcePath -Extensions $WallpaperExtensions)
+        if ($wallpapers.Count -eq 0) {
+            throw "No wallpaper files found in '$resolvedSourcePath' using extensions: $($WallpaperExtensions -join ', ')."
+        }
+
+        $maxCabSize = 2GB
+        $totalSize = [int64]0
+        $acceptedWallpapers = [System.Collections.Generic.List[System.IO.FileInfo]]::new()
+        foreach ($wallpaper in $wallpapers) {
+            if (($totalSize + $wallpaper.Length) -le $maxCabSize) {
+                $acceptedWallpapers.Add($wallpaper)
+                $totalSize += $wallpaper.Length
+            }
+        }
+        if ($acceptedWallpapers.Count -eq 0) {
+            throw "Wallpaper files were found but all exceed the 2 GiB CAB size limit."
+        }
+
+        $wallpaperEntries = @(Copy-Wallpapers -ThemeName $ThemeName -Files $acceptedWallpapers.ToArray() -StagingRoot $stagingRoot)
+        $cursorEntries = Copy-MappedResources -ThemeName $ThemeName -Map $mapConfig.Cursors -SectionName 'Cursor' -TargetFolder 'Cursors' -StagingRoot $stagingRoot -SourcePath $CursorSourcePath
+        $soundEntries = Copy-MappedResources -ThemeName $ThemeName -Map $mapConfig.Sounds -SectionName 'Sounds' -TargetFolder 'Sounds' -StagingRoot $stagingRoot -SourcePath $SoundSourcePath
+
+        $defaultWallpaper = $wallpaperEntries[0].RelativePath
+        $themeLines = New-ThemeContent -ThemeName $ThemeName -DefaultWallpaperRelativePath $defaultWallpaper -SlideshowInterval $SlideshowInterval -Shuffle:$Shuffle.IsPresent -CursorEntries $cursorEntries
+        $themeFilePath = Join-Path -Path $stagingRoot -ChildPath ("{0}.theme" -f (ConvertTo-SafeFileComponent -Value $ThemeName))
+        Set-Content -Path $themeFilePath -Value $themeLines -Encoding ASCII
+
+        $resourceEntries = [System.Collections.Generic.List[hashtable]]::new()
+        foreach ($entry in $wallpaperEntries) {
+            $resourceEntries.Add(@{
+                    SourcePath   = $entry.FullPath
+                    RelativePath = $entry.RelativePath
+                })
+        }
+        foreach ($entry in $cursorEntries.Values) {
+            $resourceEntries.Add(@{
+                    SourcePath   = $entry.FullPath
+                    RelativePath = $entry.RelativePath
+                })
+        }
+        foreach ($entry in $soundEntries.Values) {
+            $resourceEntries.Add(@{
+                    SourcePath   = $entry.FullPath
+                    RelativePath = $entry.RelativePath
+                })
+        }
+
+        $directiveFiles = New-DdfFiles -WorkingPath $stagingRoot -OutputPath $resolvedOutputPath -ThemeFilePath $themeFilePath -ResourceEntries $resourceEntries
+        Invoke-MakeCab -DirectiveFilePaths $directiveFiles
+
+        $generatedArtifacts = @(
+            Join-Path -Path $stagingRoot -ChildPath 'setup.inf'
+            Join-Path -Path $stagingRoot -ChildPath 'setup.rpt'
+        )
+        foreach ($artifact in $generatedArtifacts) {
+            if (Test-Path -Path $artifact -PathType Leaf) {
+                Remove-Item -Path $artifact -Force
+            }
+        }
+
+        if ($PassThru) {
+            [pscustomobject]@{
+                ThemeName       = $ThemeName
+                OutputPath      = (Resolve-Path -Path $resolvedOutputPath).Path
+                WallpaperCount  = $wallpaperEntries.Count
+                CursorCount     = $cursorEntries.Count
+                SoundCount      = $soundEntries.Count
+                SlideshowMillis = $SlideshowInterval
+            }
+        }
+    }
+    finally {
+        if (Test-Path -Path $stagingRoot -PathType Container) {
+            Remove-Item -Path $stagingRoot -Recurse -Force
+        }
+    }
+}
+
+Export-ModuleMember -Function New-ThemifyDesktopThemePack
